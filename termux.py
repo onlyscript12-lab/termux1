@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -143,7 +144,90 @@ class NetworkTester:
                         return parts[idx + 1]
         except (subprocess.SubprocessError, FileNotFoundError, ValueError):
             pass
+        for prop in ("dhcp.wlan0.gateway", "dhcp.eth0.gateway", "dhcp.wlan1.gateway"):
+            try:
+                out = subprocess.check_output(
+                    ["getprop", prop],
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                )
+                gw = out.decode("utf-8", errors="replace").strip()
+                if gw and gw != "0.0.0.0":
+                    return gw
+            except (subprocess.SubprocessError, FileNotFoundError):
+                continue
         return None
+
+    def get_ip_neigh_neighbors(self) -> list[dict]:
+        neighbors: list[dict] = []
+        try:
+            out = subprocess.check_output(
+                ["ip", "neigh", "show"],
+                stderr=subprocess.DEVNULL,
+                timeout=4,
+            )
+            for line in out.decode("utf-8", errors="replace").splitlines():
+                parts = line.split()
+                if not parts:
+                    continue
+                ip = parts[0]
+                state = parts[-1] if parts else ""
+                if state not in ("REACHABLE", "STALE", "DELAY", "PROBE"):
+                    continue
+                try:
+                    if not ipaddress.ip_address(ip).is_private:
+                        continue
+                except ValueError:
+                    continue
+                neighbors.append(
+                    {
+                        "ssid": f"LAN neighbor {ip}",
+                        "bssid": ip,
+                        "rssi": -52,
+                        "frequency": 0,
+                    }
+                )
+        except (subprocess.SubprocessError, FileNotFoundError):
+            pass
+        return neighbors
+
+    def _probe_host_ports(self, ip: str, ports: tuple[int, ...], timeout: float) -> Optional[int]:
+        for port in ports:
+            try:
+                with socket.create_connection((ip, port), timeout=timeout):
+                    return port
+            except OSError:
+                continue
+        return None
+
+    def scan_lan_hosts(self, local_ip: str, timeout: float = 0.35) -> list[dict]:
+        """Find active hosts on the same /24 WiFi LAN (open TCP port probe)."""
+        try:
+            network = ipaddress.ip_network(f"{local_ip}/24", strict=False)
+        except ValueError:
+            return []
+        hosts = [str(h) for h in network.hosts() if str(h) != local_ip]
+        ports = (80, 443, 8080, 8443, 22, 445, 554, 8009)
+        found: list[dict] = []
+        with ThreadPoolExecutor(max_workers=48) as pool:
+            futures = {pool.submit(self._probe_host_ports, ip, ports, timeout): ip for ip in hosts}
+            for fut in as_completed(futures):
+                ip = futures[fut]
+                try:
+                    port = fut.result()
+                except Exception:
+                    continue
+                if port is None:
+                    continue
+                found.append(
+                    {
+                        "ssid": f"Active LAN {ip}:{port}",
+                        "bssid": ip,
+                        "rssi": -48,
+                        "frequency": 0,
+                    }
+                )
+        return found
 
     def get_proc_arp_neighbors(self) -> list[dict]:
         neighbors: list[dict] = []
@@ -222,6 +306,10 @@ class NetworkTester:
             if item["bssid"] not in seen:
                 entries.append(item)
                 seen.add(item["bssid"])
+        for item in self.get_ip_neigh_neighbors():
+            if item["bssid"] not in seen:
+                entries.append(item)
+                seen.add(item["bssid"])
         return entries
 
     def _merge_network_lists(self, *lists: list[dict]) -> list[dict]:
@@ -251,10 +339,12 @@ class NetworkTester:
                     display_ip = bssid
                 else:
                     display_ip = item.get("ip") or bssid or "?"
+                mac = item.get("bssid", "")
+                ssid = item.get("ssid", "<HIDDEN>")
                 wifi_scan.append(
                     {
-                        "ssid": item.get("ssid", "<HIDDEN>"),
-                        "bssid": display_ip if display_ip.count(".") == 3 else bssid,
+                        "ssid": f"WiFi AP: {ssid}",
+                        "bssid": mac if mac else display_ip,
                         "rssi": item.get("rssi", -100),
                         "frequency": item.get("frequency", 0),
                     }
@@ -269,6 +359,17 @@ class NetworkTester:
         if connected:
             notes.append("connected WiFi OK")
         lan = self.build_lan_entries()
+        local_ip = self.get_primary_local_ip()
+        if local_ip and len(wifi_scan) < 2:
+            print(
+                c(
+                    "\n[*] Scanning nearby devices on same WiFi (LAN). Wait ~15-30 sec...\n",
+                    CLR_CYAN,
+                )
+            )
+            lan = self._merge_network_lists(lan, self.scan_lan_hosts(local_ip))
+            if len(lan) > 1:
+                notes.append("LAN active hosts scanned")
         if lan:
             notes.append("LAN IP/gateway detected")
 
@@ -290,7 +391,7 @@ class NetworkTester:
 
     def display_networks(self, networks: list[dict]) -> list[dict]:
         sorted_nets = sorted(networks, key=lambda x: x["rssi"], reverse=True)
-        print(c("\n[+] Detected networks (strongest first):\n", CLR_CYAN))
+        print(c("\n[+] WiFi APs + LAN hosts (strongest / closest first):\n", CLR_CYAN))
         hdr = f"{'#':<4} {'SSID / HOST':<28} {'IP / BSSID':<18} {'dBm':<8} {'RANGE'}"
         print(c(hdr, CLR_YELLOW))
         print("-" * 78)
