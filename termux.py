@@ -43,6 +43,42 @@ MAX_THREADS = 512
 MAX_DURATION = 3600
 MAX_PACKET = 65507
 
+PORT_SERVICE: dict[int, str] = {
+    22: "SSH",
+    80: "Web",
+    443: "HTTPS",
+    445: "SMB",
+    554: "Camera/RTSP",
+    8009: "Cast",
+    8080: "Web-alt",
+    8443: "HTTPS-alt",
+}
+
+# Common MAC OUI prefixes (vendor hint on LAN)
+OUI_VENDORS: dict[str, str] = {
+    "00:17:88": "Philips Hue",
+    "18:b4:30": "Google/Nest",
+    "28:6c:07": "Xiaomi",
+    "3c:28:6d": "Google",
+    "44:65:0d": "Amazon",
+    "50:dc:ec": "Apple",
+    "58:41:20": "Huawei",
+    "5c:ea:1d": "Microsoft",
+    "68:ff:7b": "TP-Link",
+    "84:0d:8e": "Espressif",
+    "a4:77:33": "Google",
+    "ac:bc:32": "Apple",
+    "b0:be:76": "Samsung",
+    "bc:92:6b": "Apple",
+    "c0:17:4d": "Samsung",
+    "d8:1c:79": "Amazon",
+    "dc:a6:32": "Raspberry Pi",
+    "e0:91:53": "Xiaomi",
+    "f0:18:98": "Apple",
+    "f4:f5:d8": "Google",
+    "fc:ec:da": "Ubiquiti",
+}
+
 
 @dataclass
 class RunStats:
@@ -158,6 +194,64 @@ class NetworkTester:
                 continue
         return None
 
+    def get_arp_table(self) -> dict[str, str]:
+        table: dict[str, str] = {}
+        try:
+            with open("/proc/net/arp", encoding="utf-8", errors="replace") as f:
+                next(f, None)
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 4:
+                        continue
+                    ip, mac = parts[0], parts[3].upper()
+                    if mac != "00:00:00:00:00:00":
+                        table[ip] = mac
+        except OSError:
+            pass
+        return table
+
+    def resolve_hostname(self, ip: str) -> Optional[str]:
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                fut = pool.submit(socket.gethostbyaddr, ip)
+                name, _, _ = fut.result(timeout=1.2)
+            short = name.rstrip(".").split(".")[0]
+            if short and short != ip:
+                return short
+        except Exception:
+            pass
+        return None
+
+    def vendor_from_mac(self, mac: str) -> Optional[str]:
+        norm = mac.upper().replace("-", ":")
+        prefix = norm[:8]
+        return OUI_VENDORS.get(prefix)
+
+    def label_for_host(
+        self,
+        ip: str,
+        port: Optional[int] = None,
+        role: Optional[str] = None,
+        arp: Optional[dict[str, str]] = None,
+    ) -> str:
+        arp = arp if arp is not None else self.get_arp_table()
+        bits: list[str] = []
+        if role:
+            bits.append(role)
+        host = self.resolve_hostname(ip)
+        if host:
+            bits.append(host)
+        mac = arp.get(ip)
+        if mac:
+            vendor = self.vendor_from_mac(mac)
+            if vendor and (not host or vendor.lower() not in host.lower()):
+                bits.append(vendor)
+        if port is not None:
+            svc = PORT_SERVICE.get(port, f"port {port}")
+            bits.append(svc)
+        title = " / ".join(bits) if bits else "Unknown device"
+        return f"{title} ({ip})"
+
     def get_ip_neigh_neighbors(self) -> list[dict]:
         neighbors: list[dict] = []
         try:
@@ -181,7 +275,7 @@ class NetworkTester:
                     continue
                 neighbors.append(
                     {
-                        "ssid": f"LAN neighbor {ip}",
+                        "ssid": self.label_for_host(ip),
                         "bssid": ip,
                         "rssi": -52,
                         "frequency": 0,
@@ -208,7 +302,7 @@ class NetworkTester:
             return []
         hosts = [str(h) for h in network.hosts() if str(h) != local_ip]
         ports = (80, 443, 8080, 8443, 22, 445, 554, 8009)
-        found: list[dict] = []
+        ip_ports: dict[str, list[int]] = {}
         with ThreadPoolExecutor(max_workers=48) as pool:
             futures = {pool.submit(self._probe_host_ports, ip, ports, timeout): ip for ip in hosts}
             for fut in as_completed(futures):
@@ -219,14 +313,23 @@ class NetworkTester:
                     continue
                 if port is None:
                     continue
-                found.append(
-                    {
-                        "ssid": f"Active LAN {ip}:{port}",
-                        "bssid": ip,
-                        "rssi": -48,
-                        "frequency": 0,
-                    }
-                )
+                ip_ports.setdefault(ip, []).append(port)
+
+        arp = self.get_arp_table()
+        gateway = self.get_default_gateway()
+        found: list[dict] = []
+        for ip, open_ports in ip_ports.items():
+            open_ports = sorted(set(open_ports))
+            pick = open_ports[0]
+            role = "Router" if gateway and ip == gateway else None
+            found.append(
+                {
+                    "ssid": self.label_for_host(ip, pick, role=role, arp=arp),
+                    "bssid": ip,
+                    "rssi": -48,
+                    "frequency": 0,
+                }
+            )
         return found
 
     def get_proc_arp_neighbors(self) -> list[dict]:
@@ -246,7 +349,7 @@ class NetworkTester:
                         continue
                     neighbors.append(
                         {
-                            "ssid": f"LAN device {ip}",
+                            "ssid": self.label_for_host(ip),
                             "bssid": ip,
                             "rssi": -58,
                             "frequency": 0,
@@ -292,10 +395,11 @@ class NetworkTester:
                 }
             )
             seen.add(local_ip)
+        arp = self.get_arp_table()
         if gateway and gateway not in seen:
             entries.append(
                 {
-                    "ssid": "Router / gateway",
+                    "ssid": self.label_for_host(gateway, role="Router", arp=arp),
                     "bssid": gateway,
                     "rssi": -42,
                     "frequency": 0,
