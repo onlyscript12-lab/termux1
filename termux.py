@@ -35,9 +35,16 @@ CLR_RESET = "\033[0m"
 
 BANNER = f"""
 {CLR_RED}╔══════════════════════════════════════════════════════════╗
-║     TERMUX NET STRESS / LOAD TOOL  v2  (authorized use)  ║
+║   TERMUX NET STRESS / LOAD TOOL  v3  (authorized use)    ║
 ╚══════════════════════════════════════════════════════════╝{CLR_RESET}
 """
+
+LOAD_PRESETS: dict[str, dict[str, object]] = {
+    "1": {"name": "Lite UDP", "threads": 25, "duration": 10, "size": 512, "mode": "udp"},
+    "2": {"name": "Web storm", "threads": 60, "duration": 20, "size": 1024, "mode": "http"},
+    "3": {"name": "TCP hammer", "threads": 100, "duration": 30, "size": 2048, "mode": "tcp-hold"},
+    "4": {"name": "POST flood", "threads": 80, "duration": 25, "size": 4096, "mode": "http-post"},
+}
 
 MAX_THREADS = 512
 MAX_DURATION = 3600
@@ -252,6 +259,84 @@ class NetworkTester:
         title = " / ".join(bits) if bits else "Unknown device"
         return f"{title} ({ip})"
 
+    def format_services(self, ports: list[int]) -> str:
+        if not ports:
+            return "-"
+        labels = [f"{p}({PORT_SERVICE.get(p, '?')})" for p in ports[:5]]
+        extra = f" +{len(ports) - 5}" if len(ports) > 5 else ""
+        return ",".join(labels) + extra
+
+    def http_server_hint(self, ip: str, port: int = 80, timeout: float = 1.2) -> Optional[str]:
+        try:
+            with socket.create_connection((ip, port), timeout=timeout) as s:
+                req = f"GET / HTTP/1.0\r\nHost: {ip}\r\nConnection: close\r\n\r\n"
+                s.sendall(req.encode("ascii"))
+                data = s.recv(2048).decode("latin-1", errors="replace")
+            for line in data.splitlines():
+                if line.lower().startswith("server:"):
+                    return line.split(":", 1)[1].strip()[:32]
+            lower = data.lower()
+            if "<title>" in lower:
+                start = lower.index("<title>") + 7
+                end = lower.find("</title>", start)
+                if end > start:
+                    return data[start:end].strip()[:32]
+        except OSError:
+            pass
+        return None
+
+    def tcp_latency_ms(self, ip: str, port: int, timeout: float = 1.0) -> Optional[float]:
+        start = time.perf_counter()
+        try:
+            with socket.create_connection((ip, port), timeout=timeout):
+                return (time.perf_counter() - start) * 1000.0
+        except OSError:
+            return None
+
+    def make_host_entry(
+        self,
+        ip: str,
+        *,
+        open_ports: Optional[list[int]] = None,
+        role: Optional[str] = None,
+        trust: str = "LIVE",
+        rssi: int = -48,
+        arp: Optional[dict[str, str]] = None,
+    ) -> dict:
+        arp = arp if arp is not None else self.get_arp_table()
+        ports = sorted(set(open_ports or []))
+        pick = ports[0] if ports else None
+        name = self.label_for_host(ip, pick, role=role, arp=arp)
+        if ports and pick in (80, 8080, 8000):
+            hint = self.http_server_hint(ip, pick)
+            if hint:
+                name = f"{name.split(' (')[0]} [{hint}] ({ip})"
+        mac = arp.get(ip, "")
+        lat = self.tcp_latency_ms(ip, pick) if pick else None
+        return {
+            "ssid": name,
+            "bssid": ip,
+            "rssi": rssi,
+            "frequency": 0,
+            "ports": ports,
+            "mac": mac,
+            "trust": trust,
+            "latency_ms": lat,
+        }
+
+    def suggest_port_for_mode(self, ports: list[int], mode: str) -> int:
+        if not ports:
+            return 443 if mode.startswith("http") else 80
+        if mode in ("http", "http-post"):
+            for p in (80, 8080, 8000, 443, 8443):
+                if p in ports:
+                    return p
+        if mode == "udp":
+            for p in (53, 443, 80):
+                if p in ports:
+                    return p
+        return ports[0]
+
     def get_ip_neigh_neighbors(self) -> list[dict]:
         neighbors: list[dict] = []
         try:
@@ -285,14 +370,15 @@ class NetworkTester:
             pass
         return neighbors
 
-    def _probe_host_ports(self, ip: str, ports: tuple[int, ...], timeout: float) -> Optional[int]:
+    def _probe_open_ports(self, ip: str, ports: tuple[int, ...], timeout: float) -> list[int]:
+        open_ports: list[int] = []
         for port in ports:
             try:
                 with socket.create_connection((ip, port), timeout=timeout):
-                    return port
+                    open_ports.append(port)
             except OSError:
                 continue
-        return None
+        return open_ports
 
     def scan_lan_hosts(self, local_ip: str, timeout: float = 0.35) -> list[dict]:
         """Find active hosts on the same /24 WiFi LAN (open TCP port probe)."""
@@ -301,34 +387,42 @@ class NetworkTester:
         except ValueError:
             return []
         hosts = [str(h) for h in network.hosts() if str(h) != local_ip]
-        ports = (80, 443, 8080, 8443, 22, 445, 554, 8009)
+        ports = (80, 443, 8080, 8443, 22, 445, 554, 8009, 53, 62078)
         ip_ports: dict[str, list[int]] = {}
+        done = 0
+        total = len(hosts)
         with ThreadPoolExecutor(max_workers=48) as pool:
-            futures = {pool.submit(self._probe_host_ports, ip, ports, timeout): ip for ip in hosts}
+            futures = {pool.submit(self._probe_open_ports, ip, ports, timeout): ip for ip in hosts}
             for fut in as_completed(futures):
                 ip = futures[fut]
+                done += 1
+                if done % 16 == 0 or done == total:
+                    pct = int(done * 100 / max(total, 1))
+                    sys.stdout.write(f"\r[*] LAN scan progress: {pct}% ({done}/{total})   ")
+                    sys.stdout.flush()
                 try:
-                    port = fut.result()
+                    open_ports = fut.result()
                 except Exception:
                     continue
-                if port is None:
-                    continue
-                ip_ports.setdefault(ip, []).append(port)
+                if open_ports:
+                    ip_ports[ip] = open_ports
+        if total:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
 
         arp = self.get_arp_table()
         gateway = self.get_default_gateway()
         found: list[dict] = []
         for ip, open_ports in ip_ports.items():
-            open_ports = sorted(set(open_ports))
-            pick = open_ports[0]
             role = "Router" if gateway and ip == gateway else None
             found.append(
-                {
-                    "ssid": self.label_for_host(ip, pick, role=role, arp=arp),
-                    "bssid": ip,
-                    "rssi": -48,
-                    "frequency": 0,
-                }
+                self.make_host_entry(
+                    ip,
+                    open_ports=open_ports,
+                    role=role,
+                    trust="LIVE",
+                    arp=arp,
+                )
             )
         return found
 
@@ -388,22 +482,20 @@ class NetworkTester:
         if local_ip:
             entries.append(
                 {
-                    "ssid": "This phone (your LAN IP)",
+                    "ssid": f"This phone ({local_ip})",
                     "bssid": local_ip,
                     "rssi": -35,
                     "frequency": 0,
+                    "trust": "LOCAL",
+                    "ports": [],
+                    "mac": self.get_arp_table().get(local_ip, ""),
                 }
             )
             seen.add(local_ip)
         arp = self.get_arp_table()
         if gateway and gateway not in seen:
             entries.append(
-                {
-                    "ssid": self.label_for_host(gateway, role="Router", arp=arp),
-                    "bssid": gateway,
-                    "rssi": -42,
-                    "frequency": 0,
-                }
+                self.make_host_entry(gateway, role="Router", trust="ROUTE", rssi=-42, arp=arp)
             )
             seen.add(gateway)
         for item in self.get_proc_arp_neighbors():
@@ -417,16 +509,28 @@ class NetworkTester:
         return entries
 
     def _merge_network_lists(self, *lists: list[dict]) -> list[dict]:
-        merged: list[dict] = []
-        seen: set[str] = set()
+        by_ip: dict[str, dict] = {}
         for lst in lists:
             for net in lst:
-                key = net.get("bssid", "")
-                if key in seen:
+                ip = net.get("bssid", "")
+                if not ip:
                     continue
-                seen.add(key)
-                merged.append(net)
-        return merged
+                if ip not in by_ip:
+                    by_ip[ip] = dict(net)
+                    continue
+                cur = by_ip[ip]
+                cur_ports = set(cur.get("ports") or [])
+                cur_ports.update(net.get("ports") or [])
+                cur["ports"] = sorted(cur_ports)
+                if net.get("trust") == "LIVE":
+                    cur["trust"] = "LIVE"
+                if len(str(net.get("ssid", ""))) > len(str(cur.get("ssid", ""))):
+                    cur["ssid"] = net["ssid"]
+                if net.get("latency_ms") is not None:
+                    cur["latency_ms"] = net["latency_ms"]
+                if net.get("mac"):
+                    cur["mac"] = net["mac"]
+        return list(by_ip.values())
 
     def get_wifi_scan_termux(self) -> list[dict]:
         notes: list[str] = []
@@ -464,14 +568,16 @@ class NetworkTester:
             notes.append("connected WiFi OK")
         lan = self.build_lan_entries()
         local_ip = self.get_primary_local_ip()
-        if local_ip and len(wifi_scan) < 2:
+        if local_ip:
             print(
                 c(
-                    "\n[*] Scanning nearby devices on same WiFi (LAN). Wait ~15-30 sec...\n",
+                    "\n[*] Deep LAN scan (same WiFi). ~20-40 sec...\n",
                     CLR_CYAN,
                 )
             )
+            t0 = time.perf_counter()
             lan = self._merge_network_lists(lan, self.scan_lan_hosts(local_ip))
+            notes.append(f"scan {time.perf_counter() - t0:.0f}s")
             if len(lan) > 1:
                 notes.append("LAN active hosts scanned")
         if lan:
@@ -495,23 +601,33 @@ class NetworkTester:
 
     def display_networks(self, networks: list[dict]) -> list[dict]:
         sorted_nets = sorted(networks, key=lambda x: x["rssi"], reverse=True)
-        print(c("\n[+] WiFi APs + LAN hosts (strongest / closest first):\n", CLR_CYAN))
-        hdr = f"{'#':<4} {'SSID / HOST':<28} {'IP / BSSID':<18} {'dBm':<8} {'RANGE'}"
+        live = sum(1 for n in sorted_nets if n.get("trust") == "LIVE")
+        print(
+            c(
+                f"\n[+] Targets: {len(sorted_nets)} total | {live} LIVE (TCP confirmed)\n",
+                CLR_CYAN,
+            )
+        )
+        print(c("LIVE=port open now | ROUTE=router guess | LOCAL=this phone\n", CLR_WHITE))
+        hdr = f"{'#':<3} {'HOST':<22} {'IP':<15} {'OK':<5} {'ms':<5} {'PORTS'}"
         print(c(hdr, CLR_YELLOW))
         print("-" * 78)
         for idx, net in enumerate(sorted_nets):
-            rssi = net["rssi"]
-            if rssi > -60:
-                prox = c("CLOSE", CLR_GREEN)
-            elif rssi > -75:
-                prox = c("MID", CLR_YELLOW)
-            else:
-                prox = c("FAR", CLR_RED)
-            tag = c(" *", CLR_GREEN) if idx == 0 else ""
             ip = net["bssid"]
             if not all(p.isdigit() or p == "." for p in ip.split(".")):
-                ip = net.get("ssid", ip)
-            print(f"{idx + 1:<4} {net['ssid'][:28]:<28} {ip:<18} {rssi:<8} {prox}{tag}")
+                ip = "?"
+            trust = str(net.get("trust", "?"))[:5]
+            if trust == "LIVE":
+                trust = c("LIVE", CLR_GREEN)
+            lat = net.get("latency_ms")
+            lat_s = f"{lat:.0f}" if isinstance(lat, (int, float)) else "-"
+            name = net.get("ssid", "?").split(" (")[0][:22]
+            ports = self.format_services(net.get("ports") or [])
+            tag = c("*", CLR_GREEN) if idx == 0 else " "
+            print(f"{idx + 1:<3} {name:<22} {ip:<15} {trust:<5} {lat_s:<5} {ports} {tag}")
+            mac = net.get("mac")
+            if mac:
+                print(c(f"    MAC {mac}", CLR_WHITE))
         return sorted_nets
 
     def ping_check(self, host: str, timeout: float = 2.0) -> Optional[float]:
@@ -702,15 +818,21 @@ class NetworkTester:
 def interactive_main(tester: NetworkTester) -> None:
     print(c("[1] Scanning Wi‑Fi / LAN...", CLR_CYAN))
     nets = tester.get_wifi_scan_termux()
+    sorted_nets = tester.display_networks(nets)
     if tester.scan_notice:
         print(c(f"[*] {tester.scan_notice}", CLR_YELLOW))
-    tester.display_networks(nets)
+    print(
+        c(
+            "\n[i] IP-k LIVE jelzésnél biztosak (TCP válasz). ROUTE = router, de port nem ellenőrzött.",
+            CLR_WHITE,
+        )
+    )
 
     print(c("\n=== Target ===", CLR_YELLOW))
-    print(c("Tip: pick router = gateway row, or type IP/URL. Need open port (http→80).", CLR_WHITE))
-    choice = input("Index from list, host, or URL [127.0.0.1]: ").strip() or "127.0.0.1"
-    if choice.isdigit() and 1 <= int(choice) <= len(nets):
-        sel = nets[int(choice) - 1]
+    choice = input("Index / IP / URL [2]: ").strip() or "2"
+    sel: Optional[dict] = None
+    if choice.isdigit() and 1 <= int(choice) <= len(sorted_nets):
+        sel = sorted_nets[int(choice) - 1]
         raw = sel["bssid"]
         if not all(p.isdigit() or p == "." for p in raw.split(".")):
             raw = input(f"IP for '{sel['ssid']}': ").strip() or "127.0.0.1"
@@ -718,22 +840,39 @@ def interactive_main(tester: NetworkTester) -> None:
         raw = choice
 
     host, port, path, use_tls = parse_target(raw)
-    if "://" not in choice and ":" not in choice:
+
+    print(c("\nPresets: 1=Lite UDP | 2=Web | 3=TCP hold | 4=POST | Enter=manual", CLR_MAGENTA))
+    preset_in = input("Preset: ").strip()
+    threads, duration, packet_size, mode = 100, 30, 1024, "udp"
+    if preset_in in LOAD_PRESETS:
+        p = LOAD_PRESETS[preset_in]
+        threads = int(p["threads"])
+        duration = int(p["duration"])
+        packet_size = int(p["size"])
+        mode = str(p["mode"])
+        print(c(f"→ {p['name']}: {mode}, {threads} thr, {duration}s", CLR_GREEN))
+    else:
+        print(c("\nModes: udp | tcp | tcp-hold | http | http-post", CLR_CYAN))
+        mode = input("Mode [http]: ").strip().lower() or "http"
+        t_in = input("Threads [60]: ").strip()
+        threads = int(t_in) if t_in.isdigit() else 60
+        d_in = input("Duration seconds [20]: ").strip()
+        duration = int(d_in) if d_in.isdigit() else 20
+        s_in = input("Payload bytes [1024]: ").strip()
+        packet_size = int(s_in) if s_in.isdigit() else 1024
+
+    if sel and sel.get("ports"):
+        port = tester.suggest_port_for_mode(sel["ports"], mode)
+        print(c(f"[+] Auto port from scan: {port} (open: {sel['ports']})", CLR_GREEN))
+    elif "://" not in choice and ":" not in choice:
         p_in = input(f"Port [{port}]: ").strip()
         if p_in.isdigit():
             port = int(p_in)
 
-    print(c("\nModes: udp | tcp | tcp-hold | http | http-post", CLR_CYAN))
-    mode = input("Mode [udp]: ").strip().lower() or "udp"
+    if mode.startswith("http") and port in (443, 8443):
+        use_tls = True
     if mode.startswith("http") and path == "/" and "://" in choice:
         _, port, path, use_tls = parse_target(choice)
-
-    t_in = input("Threads [100]: ").strip()
-    threads = int(t_in) if t_in.isdigit() else 100
-    d_in = input("Duration seconds [30]: ").strip()
-    duration = int(d_in) if d_in.isdigit() else 30
-    s_in = input("Payload bytes [1024]: ").strip()
-    packet_size = int(s_in) if s_in.isdigit() else 1024
 
     require_authorization(host, skip=False)
     tester.launch(host, port, threads, duration, packet_size, mode, path, use_tls)
