@@ -271,16 +271,16 @@ class NetworkTester:
             with socket.create_connection((ip, port), timeout=timeout) as s:
                 req = f"GET / HTTP/1.0\r\nHost: {ip}\r\nConnection: close\r\n\r\n"
                 s.sendall(req.encode("ascii"))
-                data = s.recv(2048).decode("latin-1", errors="replace")
+                data = s.recv(8192).decode("latin-1", errors="replace")
             for line in data.splitlines():
                 if line.lower().startswith("server:"):
-                    return line.split(":", 1)[1].strip()[:32]
+                    return line.split(":", 1)[1].strip()[:80]
             lower = data.lower()
             if "<title>" in lower:
                 start = lower.index("<title>") + 7
                 end = lower.find("</title>", start)
                 if end > start:
-                    return data[start:end].strip()[:32]
+                    return data[start:end].strip()[:80]
         except OSError:
             pass
         return None
@@ -609,25 +609,25 @@ class NetworkTester:
             )
         )
         print(c("LIVE=port open now | ROUTE=router guess | LOCAL=this phone\n", CLR_WHITE))
-        hdr = f"{'#':<3} {'HOST':<22} {'IP':<15} {'OK':<5} {'ms':<5} {'PORTS'}"
+        hdr = f"{'#':<3} {'IP':<15} {'OK':<6} {'ms':<5} {'OPEN PORTS'}"
         print(c(hdr, CLR_YELLOW))
         print("-" * 78)
         for idx, net in enumerate(sorted_nets):
             ip = net["bssid"]
             if not all(p.isdigit() or p == "." for p in ip.split(".")):
                 ip = "?"
-            trust = str(net.get("trust", "?"))[:5]
-            if trust == "LIVE":
-                trust = c("LIVE", CLR_GREEN)
+            trust_raw = str(net.get("trust", "?"))
+            trust = c(trust_raw, CLR_GREEN) if trust_raw == "LIVE" else trust_raw
             lat = net.get("latency_ms")
             lat_s = f"{lat:.0f}" if isinstance(lat, (int, float)) else "-"
-            name = net.get("ssid", "?").split(" (")[0][:22]
+            full_name = net.get("ssid", "Unknown device")
             ports = self.format_services(net.get("ports") or [])
-            tag = c("*", CLR_GREEN) if idx == 0 else " "
-            print(f"{idx + 1:<3} {name:<22} {ip:<15} {trust:<5} {lat_s:<5} {ports} {tag}")
+            tag = c("  * default", CLR_GREEN) if idx == 0 else ""
+            print(f"{idx + 1:<3} {ip:<15} {trust:<6} {lat_s:<5} {ports}{tag}")
+            print(c(f"     name: {full_name}", CLR_CYAN))
             mac = net.get("mac")
             if mac:
-                print(c(f"    MAC {mac}", CLR_WHITE))
+                print(c(f"     mac:  {mac}", CLR_WHITE))
         return sorted_nets
 
     def ping_check(self, host: str, timeout: float = 2.0) -> Optional[float]:
@@ -823,7 +823,7 @@ def interactive_main(tester: NetworkTester) -> None:
         print(c(f"[*] {tester.scan_notice}", CLR_YELLOW))
     print(
         c(
-            "\n[i] IP-k LIVE jelzésnél biztosak (TCP válasz). ROUTE = router, de port nem ellenőrzött.",
+            "\n[i] LIVE = IP confirmed (TCP reply). ROUTE = router from routing table, ports not verified.",
             CLR_WHITE,
         )
     )
@@ -850,7 +850,7 @@ def interactive_main(tester: NetworkTester) -> None:
         duration = int(p["duration"])
         packet_size = int(p["size"])
         mode = str(p["mode"])
-        print(c(f"→ {p['name']}: {mode}, {threads} thr, {duration}s", CLR_GREEN))
+        print(c(f"-> {p['name']}: {mode}, {threads} thr, {duration}s", CLR_GREEN))
     else:
         print(c("\nModes: udp | tcp | tcp-hold | http | http-post", CLR_CYAN))
         mode = input("Mode [http]: ").strip().lower() or "http"
