@@ -118,9 +118,127 @@ class NetworkTester:
     def __init__(self) -> None:
         self.stop = threading.Event()
         self.stats = RunStats()
+        self.scan_notice = ""
+
+    def get_primary_local_ip(self) -> Optional[str]:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("1.1.1.1", 80))
+                return s.getsockname()[0]
+        except OSError:
+            return None
+
+    def get_default_gateway(self) -> Optional[str]:
+        try:
+            out = subprocess.check_output(
+                ["ip", "route", "show", "default"],
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            for line in out.decode("utf-8", errors="replace").splitlines():
+                parts = line.split()
+                if "via" in parts:
+                    idx = parts.index("via")
+                    if idx + 1 < len(parts):
+                        return parts[idx + 1]
+        except (subprocess.SubprocessError, FileNotFoundError, ValueError):
+            pass
+        return None
+
+    def get_proc_arp_neighbors(self) -> list[dict]:
+        neighbors: list[dict] = []
+        try:
+            with open("/proc/net/arp", encoding="utf-8", errors="replace") as f:
+                next(f, None)
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 4 or parts[3] == "00:00:00:00:00:00":
+                        continue
+                    ip = parts[0]
+                    try:
+                        if not ipaddress.ip_address(ip).is_private:
+                            continue
+                    except ValueError:
+                        continue
+                    neighbors.append(
+                        {
+                            "ssid": f"LAN device {ip}",
+                            "bssid": ip,
+                            "rssi": -58,
+                            "frequency": 0,
+                        }
+                    )
+        except OSError:
+            pass
+        return neighbors
+
+    def get_connected_wifi_termux(self) -> Optional[dict]:
+        try:
+            out = subprocess.check_output(
+                ["termux-wifi-connectioninfo"],
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            data = json.loads(out.decode("utf-8"))
+            ssid = data.get("ssid") or "<WiFi>"
+            ip = data.get("ip") or self.get_primary_local_ip()
+            if not ip:
+                return None
+            return {
+                "ssid": f"Connected: {ssid}",
+                "bssid": ip,
+                "rssi": int(data.get("rssi", -45)),
+                "frequency": int(data.get("frequency") or 0),
+            }
+        except (subprocess.SubprocessError, json.JSONDecodeError, FileNotFoundError, TypeError, ValueError):
+            return None
+
+    def build_lan_entries(self) -> list[dict]:
+        entries: list[dict] = []
+        seen: set[str] = set()
+        local_ip = self.get_primary_local_ip()
+        gateway = self.get_default_gateway()
+        if local_ip:
+            entries.append(
+                {
+                    "ssid": "This phone (your LAN IP)",
+                    "bssid": local_ip,
+                    "rssi": -35,
+                    "frequency": 0,
+                }
+            )
+            seen.add(local_ip)
+        if gateway and gateway not in seen:
+            entries.append(
+                {
+                    "ssid": "Router / gateway",
+                    "bssid": gateway,
+                    "rssi": -42,
+                    "frequency": 0,
+                }
+            )
+            seen.add(gateway)
+        for item in self.get_proc_arp_neighbors():
+            if item["bssid"] not in seen:
+                entries.append(item)
+                seen.add(item["bssid"])
+        return entries
+
+    def _merge_network_lists(self, *lists: list[dict]) -> list[dict]:
+        merged: list[dict] = []
+        seen: set[str] = set()
+        for lst in lists:
+            for net in lst:
+                key = net.get("bssid", "")
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(net)
+        return merged
 
     def get_wifi_scan_termux(self) -> list[dict]:
-        networks: list[dict] = []
+        notes: list[str] = []
+        wifi_scan: list[dict] = []
         try:
             out = subprocess.check_output(
                 ["termux-wifi-scaninfo"],
@@ -128,46 +246,46 @@ class NetworkTester:
                 timeout=8,
             )
             for item in json.loads(out.decode("utf-8")):
-                networks.append(
+                bssid = item.get("bssid", "")
+                if bssid and ":" in bssid and bssid.count(".") != 3:
+                    display_ip = bssid
+                else:
+                    display_ip = item.get("ip") or bssid or "?"
+                wifi_scan.append(
                     {
                         "ssid": item.get("ssid", "<HIDDEN>"),
-                        "bssid": item.get("bssid", "00:00:00:00:00:00"),
+                        "bssid": display_ip if display_ip.count(".") == 3 else bssid,
                         "rssi": item.get("rssi", -100),
                         "frequency": item.get("frequency", 0),
                     }
                 )
-        except (subprocess.SubprocessError, json.JSONDecodeError, FileNotFoundError):
-            networks = self.get_fallback_network_info()
-        return networks
+            notes.append("WiFi scan OK (termux-api)")
+        except FileNotFoundError:
+            notes.append("termux-wifi-scaninfo missing → pkg install termux-api + Termux:API app")
+        except (subprocess.SubprocessError, json.JSONDecodeError):
+            notes.append("WiFi scan failed → enable Location for Termux + Termux:API")
 
-    def get_fallback_network_info(self) -> list[dict]:
-        networks: list[dict] = []
-        try:
-            arp_out = subprocess.check_output(["arp", "-a"], stderr=subprocess.DEVNULL, timeout=5)
-            for line in arp_out.decode("utf-8", errors="replace").splitlines():
-                parts = line.split()
-                if len(parts) >= 4:
-                    ip = parts[1].strip("()")
-                    mac = parts[3]
-                    networks.append(
-                        {
-                            "ssid": f"Host ({ip})",
-                            "bssid": ip,
-                            "rssi": -50,
-                            "frequency": 2412,
-                        }
-                    )
-        except (subprocess.SubprocessError, FileNotFoundError):
-            pass
+        connected = self.get_connected_wifi_termux()
+        if connected:
+            notes.append("connected WiFi OK")
+        lan = self.build_lan_entries()
+        if lan:
+            notes.append("LAN IP/gateway detected")
+
+        networks = self._merge_network_lists(
+            ([connected] if connected else []),
+            lan,
+            wifi_scan,
+        )
 
         if not networks:
-            networks.extend(
-                [
-                    {"ssid": "Localhost", "bssid": "127.0.0.1", "rssi": -30, "frequency": 0},
-                    {"ssid": "Typical gateway", "bssid": "192.168.1.1", "rssi": -42, "frequency": 5000},
-                    {"ssid": "LAN example", "bssid": "192.168.1.100", "rssi": -55, "frequency": 2437},
-                ]
-            )
+            notes.append("no LAN data — showing examples only")
+            networks = [
+                {"ssid": "(example) localhost", "bssid": "127.0.0.1", "rssi": -30, "frequency": 0},
+                {"ssid": "(example) gateway", "bssid": "192.168.1.1", "rssi": -42, "frequency": 0},
+            ]
+
+        self.scan_notice = " | ".join(notes)
         return networks
 
     def display_networks(self, networks: list[dict]) -> list[dict]:
@@ -378,9 +496,13 @@ class NetworkTester:
 
 def interactive_main(tester: NetworkTester) -> None:
     print(c("[1] Scanning Wi‑Fi / LAN...", CLR_CYAN))
-    nets = tester.display_networks(tester.get_wifi_scan_termux())
+    nets = tester.get_wifi_scan_termux()
+    if tester.scan_notice:
+        print(c(f"[*] {tester.scan_notice}", CLR_YELLOW))
+    tester.display_networks(nets)
 
     print(c("\n=== Target ===", CLR_YELLOW))
+    print(c("Tip: pick router = gateway row, or type IP/URL. Need open port (http→80).", CLR_WHITE))
     choice = input("Index from list, host, or URL [127.0.0.1]: ").strip() or "127.0.0.1"
     if choice.isdigit() and 1 <= int(choice) <= len(nets):
         sel = nets[int(choice) - 1]
